@@ -59,20 +59,28 @@
    (msrp :initarg :msrp :reader isbn-result-msrp)
    (offers :initarg :offers :reader isbn-result-offers)))
 
+(defgeneric isbn-result-isbn (result)
+  (:method ((result isbn-result))
+    (or (isbn-result-isbn13 result)
+        (isbn-result-isbn10 result)
+        (isbn-result-requested-isbn result))))
+
 (defun parse-price-string (string)
   (multiple-value-bind (match dollars-cents)
-      (cl-ppcre:scan-to-strings "\\$?(\\d*)\\.(\\d\\d)" string)
+      (cl-ppcre:scan-to-strings "^\\$?(\\d*)(?:\\.(?:(\\d\\d))?)?$" string)
     (when (null match)
       (error "bad price string: ~S" string))
     (let ((dollars (aref dollars-cents 0))
-          (cents   (aref dollars-cents 1)))
+          (cents   (or (aref dollars-cents 1)
+                       "00")))
       (when (zerop (length dollars))
         (setf dollars "0"))
       (+ (parse-integer dollars)
          (/ (parse-integer cents) 100)))))
 
 (defclass offer ()
-  ((condition :initarg :condition :reader offer-condition)
+  ((creation-time :initarg :creation-time :reader offer-creation-time)
+   (condition :initarg :condition :reader offer-condition)
    (price :initarg :price :reader offer-price)))
 
 (defmethod print-object ((o offer) stream)
@@ -86,30 +94,37 @@
                                  (http-get
                                   (isbndb-uri isbn)
                                   `(("Authorization" . ,*isbndb-api-key*)))))))
-    (make-instance 'isbn-result
-                   :requested-isbn isbn
-                   :isbn10 (gethash "isbn" result)
-                   :isbn13 (gethash "isbn_13" result)
-                   :language (gethash "language" result)
-                   :short-title (gethash "title" result)
-                   :title (gethash "title_long" result)
-                   :subtitle (gethash "subtitle" result)
-                   :authors (gethash "authors" result)
-                   :publishers (list (gethash "publisher" result))
-                   :publish-date (gethash "date_published" result)                   
-                   :page-count (gethash "pages" result)
-                   :dewey-classes (alexandria:ensure-list
-                                   (gethash "dewey_decimal" result))
-                   :subjects (gethash "subjects" result)
-                   :msrp (parse-price-string (gethash "msrp" result))
-                   :offers (sort (loop :for offer :in (gethash "prices" result)
-                                       :collect (make-instance
-                                                 'offer
-                                                 :condition (gethash "condition" offer)
-                                                 :price (parse-price-string
-                                                         (gethash "price" offer))))
-                                 #'<
-                                 :key #'offer-price))))
+    (cond
+      ((null result)
+       (warn "Failed to get result...")
+       (sleep 1)
+       (lookup isbn))
+      (t
+       (make-instance 'isbn-result
+                      :requested-isbn isbn
+                      :isbn10 (gethash "isbn" result)
+                      :isbn13 (gethash "isbn13" result)
+                      :language (gethash "language" result)
+                      :short-title (gethash "title" result)
+                      :title (gethash "title_long" result)
+                      :authors (gethash "authors" result)
+                      :publishers (alexandria:ensure-list
+                                   (gethash "publisher" result))
+                      :publish-date (gethash "date_published" result)
+                      :page-count (gethash "pages" result)
+                      :dewey-classes (alexandria:ensure-list
+                                      (gethash "dewey_decimal" result))
+                      :subjects (gethash "subjects" result)
+                      :msrp (parse-price-string (gethash "msrp" result))
+                      :offers (sort (loop :for offer :in (gethash "prices" result)
+                                          :collect (make-instance
+                                                    'offer
+                                                    :creation-time (get-universal-time)
+                                                    :condition (gethash "condition" offer)
+                                                    :price (parse-price-string
+                                                            (gethash "price" offer))))
+                                    #'<
+                                    :key #'offer-price))))))
 
 (defun format-price (price)
   (multiple-value-bind (whole part)
@@ -135,19 +150,100 @@
                        (offer-condition offer)))
      (fresh-line))))
 
+(defun entry-summary (entry)
+  (flet ((chop (n str)
+           (if (<= (length str) n)
+               str
+               (subseq str 0 n))))
+    (cond
+      ((or (null entry) (keywordp entry))
+       "")
+      ((and (typep entry 'isbn-result)
+            (stringp (isbn-result-title entry)))
+       (string-trim '(#\Space) (chop 20 (isbn-result-title entry))))
+      (t
+       "???"))))
+
+;;; database
+
+(defmacro with-db ((db path) &body body)
+  `(sqlite:with-open-database (,db ,path)
+     (sqlite:execute-non-query ,db "PRAGMA foreign_keys = ON;")
+     ,@body))
+
+(defun find-or-make-database (&key (root (user-homedir-pathname)))
+  (let ((db-path (merge-pathnames ".cadrlogue/media.db" root)))
+    (ensure-directories-exist db-path)
+    (cond
+      ((probe-file db-path)
+       db-path)
+      (t
+       (format t "~&Creating database...~%")
+       (with-db (db db-path)
+         (sqlite:with-transaction db
+           (sqlite:execute-non-query db "CREATE TABLE details (id INTEGER PRIMARY KEY, isbn13 STRING NULL, title STRING NULL, msrp_cents INTEGER NULL)")
+           (sqlite:execute-non-query db "CREATE TABLE offers (id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, condition STRING NULL, price_cents INTEGER NOT NULL, item INTEGER NOT NULL, FOREIGN KEY(item) REFERENCES details(id))")
+           (sqlite:execute-non-query db "CREATE TABLE media (physical_id INTEGER PRIMARY KEY AUTOINCREMENT, isbn STRING NULL, status STRING NOT NULL, info INTEGER NULL, FOREIGN KEY(info) REFERENCES details(id))")))
+       db-path))))
+
+;;; Cataloguing flow
+
 (defun prompt-line (prompt)
   (write-string prompt)
   (finish-output)
   (read-line))
 
-(defun run (n)
-  (loop :repeat n
-        :for line := (prompt-line "ISBN: ")
-        :do (cond
-              ((isbn? line)
-               (fresh-line)
-               (print-info (lookup line))
-               (fresh-line)
-               (terpri))
-              (t
-               (format t "~&Invalid thing: ~S~%" line)))))
+(defun find-details-id-by-isbn (db isbn)
+  (assert (isbn? isbn))
+  (caar (sqlite:execute-to-list db "SELECT id FROM details WHERE isbn13=? LIMIT 1"
+                                isbn)))
+
+(defun record (db entry)
+  (etypecase entry
+    (isbn-result
+     (sqlite:with-transaction db
+       (let ((info (find-details-id-by-isbn db (isbn-result-isbn entry))))
+         (when (null info)
+           (sqlite:execute-non-query db
+                                     "INSERT INTO details (isbn13, title, msrp_cents) VALUES (?, ?, ?)"
+                                     (isbn-result-isbn13 entry)
+                                     (or (isbn-result-title entry)
+                                         (isbn-result-short-title entry))
+                                     (round (* 100 (isbn-result-msrp entry))))
+           (setf info (sqlite:last-insert-rowid db))
+           (dolist (offer (isbn-result-offers entry))
+             (sqlite:execute-non-query db
+                                       "INSERT INTO offers (timestamp, condition, price_cents,item) VALUES (?,?,?,?)"
+                                       (offer-creation-time offer)
+                                       (offer-condition offer)
+                                       (round (* 100 (offer-price offer)))
+                                       info)))
+         (sqlite:execute-non-query db
+                                   "INSERT INTO media (isbn, status,info) VALUES (?, ?,?)"
+                                   (isbn-result-requested-isbn entry)
+                                   "ACTIVE"
+                                   info))
+       (sqlite:last-insert-rowid db)))
+    ((member :UNKNOWN)
+     (sqlite:execute-non-query db
+                               "INSERT INTO media (isbn, status) VALUES (?, ?)"
+                               nil
+                               "ACTIVE")
+     (sqlite:last-insert-rowid db))))
+
+(defun print-barcode (id)
+  (format t "~&==> ID~64,'0B~%" id))
+
+(defun run (&key)
+  (with-db (db (find-or-make-database))
+    (loop :repeat 4 :do
+      (let ((scan (prompt-line "Scan: ")))
+        (cond
+          ((isbn? scan)
+           (let* ((record (lookup scan))
+                  (id (record db record)))
+             (print-barcode id)))
+          ((string-equal scan "WEEE INSERT")
+           (print-barcode (record db ':unknown)))
+          (t
+           (format t "Unknown thing: ~S~%" scan)))))))
