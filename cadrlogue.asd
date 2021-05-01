@@ -19,7 +19,7 @@
   :author "Robert Smith <robert@stylewarning.com>"
   :license "GPLv3"
   :description "Book and media cataloguing system"
-  :depends-on (#:drakma #:yason #:flexi-streams)
+  :depends-on (#:alexandria #:uiop #:drakma #:yason #:flexi-streams)
   :pathname "src/"
   :serial t
   :components ((:static-file "LICENSE.txt")
