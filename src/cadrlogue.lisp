@@ -198,32 +198,36 @@
   (caar (sqlite:execute-to-list db "SELECT id FROM details WHERE isbn13=? LIMIT 1"
                                 isbn)))
 
-(defun record (db entry)
+(defun record (db requested-isbn entry)
   (etypecase entry
     (isbn-result
-     (sqlite:with-transaction db
-       (let ((info (find-details-id-by-isbn db (isbn-result-isbn entry))))
-         (when (null info)
-           (sqlite:execute-non-query db
-                                     "INSERT INTO details (isbn13, title, msrp_cents) VALUES (?, ?, ?)"
-                                     (isbn-result-isbn13 entry)
-                                     (or (isbn-result-title entry)
-                                         (isbn-result-short-title entry))
-                                     (round (* 100 (isbn-result-msrp entry))))
-           (setf info (sqlite:last-insert-rowid db))
-           (dolist (offer (isbn-result-offers entry))
-             (sqlite:execute-non-query db
-                                       "INSERT INTO offers (timestamp, condition, price_cents,item) VALUES (?,?,?,?)"
-                                       (offer-creation-time offer)
-                                       (offer-condition offer)
-                                       (round (* 100 (offer-price offer)))
-                                       info)))
-         (sqlite:execute-non-query db
-                                   "INSERT INTO media (isbn, status,info) VALUES (?, ?,?)"
-                                   (isbn-result-requested-isbn entry)
-                                   "ACTIVE"
-                                   info))
-       (sqlite:last-insert-rowid db)))
+     (let ((info (find-details-id-by-isbn db (isbn-result-isbn entry))))
+       (cond
+         ((null info)
+          (sqlite:execute-non-query db
+                                    "INSERT INTO details (isbn13, title, msrp_cents) VALUES (?, ?, ?)"
+                                    (isbn-result-isbn13 entry)
+                                    (or (isbn-result-title entry)
+                                        (isbn-result-short-title entry))
+                                    (round (* 100 (isbn-result-msrp entry))))
+          (setf info (sqlite:last-insert-rowid db))
+          (dolist (offer (isbn-result-offers entry))
+            (sqlite:execute-non-query db
+                                      "INSERT INTO offers (timestamp, condition, price_cents,item) VALUES (?,?,?,?)"
+                                      (offer-creation-time offer)
+                                      (offer-condition offer)
+                                      (round (* 100 (offer-price offer)))
+                                      info))
+          (record db requested-isbn info))
+         (t
+          (record db requested-isbn info)))))
+    (integer
+     (sqlite:execute-non-query db
+                               "INSERT INTO media (isbn, status,info) VALUES (?, ?,?)"
+                               requested-isbn
+                               "ACTIVE"
+                               entry)
+     (sqlite:last-insert-rowid db))
     ((member :UNKNOWN)
      (sqlite:execute-non-query db
                                "INSERT INTO media (isbn, status) VALUES (?, ?)"
@@ -236,14 +240,19 @@
 
 (defun run (&key)
   (with-db (db (find-or-make-database))
-    (loop :repeat 4 :do
+    (loop
       (let ((scan (prompt-line "Scan: ")))
         (cond
           ((isbn? scan)
-           (let* ((record (lookup scan))
-                  (id (record db record)))
-             (print-barcode id)))
+           (let ((details-id (find-details-id-by-isbn db scan)))
+             (cond
+               ((null details-id)
+                (print-barcode (record db scan (lookup scan))))
+               (t
+                (print-barcode (record db scan details-id))))))
           ((string-equal scan "WEEE INSERT")
-           (print-barcode (record db ':unknown)))
+           (print-barcode (record db nil ':unknown)))
+          ((string-equal scan "quit")
+           (return-from run))
           (t
-           (format t "Unknown thing: ~S~%" scan)))))))
+           (warn "Unknown thing ~S, ignoring..." scan)))))))
