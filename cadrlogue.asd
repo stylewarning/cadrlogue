@@ -29,4 +29,5 @@
   :serial t
   :components ((:static-file "LICENSE.txt")
                (:file "package")
+               (:file "esc-pos")
                (:file "cadrlogue")))

@@ -236,7 +236,11 @@
      (sqlite:last-insert-rowid db))))
 
 (defun print-barcode (id)
-  (format t "~&==> ID~64,'0B~%" id))
+  (assert (<= 0 id 9999999999))
+  (let ((id-string (format nil "~10,'0D" id)))
+    (format t "~&==> printing code for ~A~%" id-string)
+    (print-barcode-label id-string)
+    nil))
 
 (defun run (&key)
   (with-db (db (find-or-make-database))
