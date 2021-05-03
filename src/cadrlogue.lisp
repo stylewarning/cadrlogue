@@ -118,6 +118,11 @@
 
 ;;; Cataloguing flow
 
+(defun null-if-empty (x)
+  (if (zerop (length x))
+      nil
+      x))
+
 (defun prompt-line (prompt)
   (write-string prompt)
   (finish-output)
@@ -133,11 +138,14 @@
   (caar (sqlite:execute-to-list db "SELECT title FROM publication_details WHERE pub_id=? LIMIT 1"
                                 pubid)))
 
-(defun record-anonymous (db)
+(defun record-anonymous (db &key requested-isbn
+                                 condition)
   "Record an anonymous artifact in the database. Details may be added later."
   (sqlite:execute-non-query db
-                            "INSERT INTO media (timestamp, status) VALUES (?, ?)"
+                            "INSERT INTO media (timestamp, imprinted_isbn, condition, status) VALUES (?, ?, ?, ?)"
                             (get-universal-time)
+                            requested-isbn
+                            condition
                             "ACTIVE")
   (sqlite:last-insert-rowid db))
 
@@ -185,8 +193,17 @@
 (defun run (&key)
   (with-db (db (find-or-make-database))
     (loop
-      (let ((scan (prompt-line "Scan: ")))
+      (let ((scan (prompt-line "COMMAND: ")))
         (cond
+          ((string-equal scan "HELP")
+           (fresh-line)
+           (format t "Commands are:~%")
+           (format t "    <isbn>     : Scan in and record an ISBN for a physical item.~%")
+           (format t "    QUIT       : Quit.~%")
+           (format t "    HELP       : Print this help message.~%")
+           (format t "    DEFER      : Record a new physical item with no details.~%")
+           (format t "    MANUAL     : Enter data manually for a new physical item.~%")
+           (format t "    CHECK-ISBN : Look up an ISBN and print data about it.~%"))
           ((isbn? scan)
            ;; First check if we've seen this before...
            (let ((details-id (find-details-id-by-isbn db scan)))
@@ -212,10 +229,49 @@
                 (print-id-as-barcode (record-known db details-id :requested-isbn scan)
                                      :header (format-header
                                               (find-title-by-pubid db details-id)))))))
+          ((string-equal scan "CHECK-ISBN")
+           (let ((isbn (prompt-line "ISBN: ")))
+             (cond
+               ((not (isbn? isbn))
+                (format t "Not an ISBN...~%"))
+               (t
+                (let ((result (lookup-isbn isbn)))
+                  (cond
+                    ((null result)
+                     (format t "Sorry, couldn't find info from ISBNdb~%"))
+                    (t
+                     (format t "Title  : ~A~%" (isbn-result-title result))
+                     (format t "Authors: ~{~A~^; ~}~%" (isbn-result-authors result))
+                     (format t "ISBN10 : ~A~%" (isbn-result-isbn10 result))
+                     (format t "ISBN13 : ~A~%" (isbn-result-isbn13 result))
+                     (format t "Offers : ~{$~A~^, ~}~%"
+                             (mapcar (alexandria:compose #'format-price #'offer-price)
+                                     (isbn-result-offers result))))))))))
+          ((string-equal scan "MANUAL")
+           (tagbody
+            :REDO
+              (let ((isbn (null-if-empty (prompt-line "ISBN: ")))
+                    (condition (null-if-empty (prompt-line "Condition: ")))
+                    (title (null-if-empty (prompt-line "Title: ")))
+                    (authors (loop :for i :from 1
+                                   :for author := (null-if-empty
+                                                   (prompt-line
+                                                    (format nil "Author #~D: " i)))
+                                   :if (null author)
+                                     :do (loop-finish)
+                                   :else
+                                     :collect author)))
+                (unless (y-or-n-p "Is the above information correct?")
+                  (go :REDO))
+                ;; TODO: record above info in database
+                (print-id-as-barcode (record-anonymous db)
+                                     :header (format-header title)))))
           ((string-equal scan "DEFER")
            (print-id-as-barcode (record-anonymous db)))
           ((string-equal scan "QUIT")
            (return-from run))
+          ((string-equal scan "")
+           nil)
           (t
            (warn "Unknown command ~S, ignoring..." scan)))))))
 
