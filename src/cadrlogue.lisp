@@ -106,19 +106,15 @@
             whole
             (round (* 100 part)))))
 
-(defun entry-summary (entry)
+(defun format-header (string)
   (flet ((chop (n str)
            (if (<= (length str) n)
                str
-               (subseq str 0 n))))
-    (cond
-      ((or (null entry) (keywordp entry))
-       "")
-      ((and (typep entry 'isbn-result)
-            (stringp (isbn-result-title entry)))
-       (string-trim '(#\Space) (chop 20 (isbn-result-title entry))))
-      (t
-       "???"))))
+               (concatenate 'string (subseq str 0 n) "...")))
+         (not-asciip (c)
+           (not (and (graphic-char-p c)
+                     (<= 0 (char-code c) 127)))))
+    (string-trim '(#\Space) (chop 40 (substitute-if #\_ #'not-asciip string)))))
 
 ;;; Cataloguing flow
 
@@ -131,6 +127,11 @@
   (assert (isbn? isbn))
   (caar (sqlite:execute-to-list db "SELECT pub_id FROM publication_details WHERE isbn=? LIMIT 1"
                                 isbn)))
+
+(defun find-title-by-pubid (db pubid)
+  (check-type pubid unsigned-byte)
+  (caar (sqlite:execute-to-list db "SELECT title FROM publication_details WHERE pub_id=? LIMIT 1"
+                                pubid)))
 
 (defun record-anonymous (db)
   "Record an anonymous artifact in the database. Details may be added later."
@@ -173,11 +174,11 @@
 (defvar *barcode-printer* (make-instance 'epl2-printer :serial-device "/dev/ttyUSB3"))
 (defvar *barcode-format* ':code128)
 
-(defun print-id-as-barcode (id)
+(defun print-id-as-barcode (id &key header)
   (assert (<= 0 id 9999999999))
   (let ((id-string (format nil "~10,'0D" id)))
     (format t "~&==> printing code for ~A~%" id-string)
-    (print-barcode *barcode-printer* *barcode-format* id-string)
+    (print-barcode *barcode-printer* *barcode-format* id-string :header header)
     nil))
 
 
@@ -193,19 +194,24 @@
                ;; We haven't...
                ((null details-id)
                 ;; ... so we'll try to look it up.
-                (multiple-value-bind (isbn-record error) (ignore-errors (lookup-isbn scan))
+                (multiple-value-bind (result error) (ignore-errors (lookup-isbn scan))
                   (cond
                     ;; Lookup failed, just record the thing and move on.
                     ((or (not (null error))
-                         (null isbn-record))
+                         (null result))
                      (warn "Failed to look up ISBN ~S" scan)
                      (print-id-as-barcode (record-anonymous db)))
                     ;; Lookup succeeded. Store it.
                     (t
-                     (print-id-as-barcode (record db scan isbn-record))))))
+                     (print-id-as-barcode (record db scan result)
+                                          :header (format-header
+                                                   (isbn-result-title
+                                                    result)))))))
                ;; We have seen this kind of before.
                (t
-                (print-id-as-barcode (record-known db details-id :requested-isbn scan))))))
+                (print-id-as-barcode (record-known db details-id :requested-isbn scan)
+                                     :header (format-header
+                                              (find-title-by-pubid db details-id)))))))
           ((string-equal scan "DEFER")
            (print-id-as-barcode (record-anonymous db)))
           ((string-equal scan "QUIT")

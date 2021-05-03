@@ -9,7 +9,7 @@
 
 (defvar *barcode-height* 64)
 
-(defgeneric print-barcode (printer kind string))
+(defgeneric print-barcode (printer kind string &key header))
 
 ;;; Supported kinds:
 ;;;
@@ -82,7 +82,7 @@
   (write-string "{B" f)
   (write-string string f))
 
-(defmethod print-barcode ((printer pos-printer) (type (eql :code128)) (string string))
+(defmethod print-barcode ((printer pos-printer) (type (eql :code128)) (string string) &key header)
   (with-open-file (f (pos-printer-serial-device printer)
                      :direction ':output
                      :if-does-not-exist ':error
@@ -93,6 +93,8 @@
       (write-byte 0 f)
       (write-esc f #\a)                 ; Center justify
       (write-byte 1 f)
+      (when header
+        (write-line header f))
       (pos-write-code128-barcode f string)
       (pos-feed-lines f 1)
       (pos-cut-paper f)
@@ -124,7 +126,7 @@
           human-readable-annotation-p
           string))
 
-(defmethod print-barcode ((printer epl2-printer) (kind (eql :code128)) (string string))
+(defmethod print-barcode ((printer epl2-printer) (kind (eql :code128)) (string string) &key header)
   (with-open-file (f (epl2-printer-serial-device printer)
                      :direction ':output
                      :if-does-not-exist ':error
@@ -132,6 +134,8 @@
                      :element-type '(unsigned-byte 8))
     (let ((f (flexi-streams:make-flexi-stream f :external-format ':ascii)))
       (write-line "N" f)                ; Clear image buffer
+      (when header
+        (format f "A0,0,0,1,1,1,N,~S~%" header))
       (write-line (epl2-code128-command string :x 0 :y 25 :thin 3) f)
       (write-line "P1" f)               ; Print 1 copy
       nil)))
