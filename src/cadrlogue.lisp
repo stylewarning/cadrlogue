@@ -1,47 +1,16 @@
 (in-package #:cadrlogue)
 
-;;; Barcode reader is assumed to write to stdin, and append a CR to
-;;; the end of the read.
-
-(define-condition http-status (condition)
-  ((code :initarg :code :reader http-status-code)
-   (reason :initarg :reason :reader http-status-reason)))
-
-(define-condition http-error-status (http-status error)
-  ())
-
-(defun http-get (uri &optional headers)
-  (multiple-value-bind (result code headers uri-from stream closed? reason)
-      (drakma:http-request uri :additional-headers headers)
-    (declare (ignore headers uri-from stream closed?))
-    (cond
-      ((= 200 code)
-       (signal 'http-status :code code :reason reason)
-       (etypecase result
-         (string result)
-         (vector (flexi-streams:octets-to-string result))))
-      ((<= 400 code 499)
-       (error 'http-error-status :code code :reason reason))
-      ((<= 500 code 599)
-       (error 'http-error-status :code code :reason reason))
-      (t
-       (signal 'http-status :code code :reason reason)))))
-
 (defun isbn? (x)
   (and (stringp x)
        (every #'digit-char-p x)
        (or (= 10 (length x))
            (= 13 (length x)))))
 
-(defun open-library-isbn-uri (isbn)
-  (assert (isbn? isbn))
-  (format nil "https://openlibrary.org/isbn/~A.json" isbn))
-
-(defparameter *isbndb-api-key* (uiop:getenvp "ISBNDB_API_KEY"))
+(defvar *isbndb-api-key* (uiop:getenvp "ISBNDB_API_KEY"))
 
 (defun isbndb-uri (isbn)
   (assert (isbn? isbn))
-  (format nil "https://api2.isbndb.com/book/~A?with_prices=1" isbn))
+  (format nil "https://api.pro.isbndb.com/book/~A?with_prices=1" isbn))
 
 (defclass isbn-result ()
   ((requested-isbn :initarg :requested-isbn :reader isbn-result-requested-isbn)
@@ -89,16 +58,20 @@
             (offer-condition o)
             (format-price (offer-price o)))))
 
-(defun lookup (isbn)
-  (let ((result (gethash "book" (yason:parse
-                                 (http-get
-                                  (isbndb-uri isbn)
-                                  `(("Authorization" . ,*isbndb-api-key*)))))))
+(defun lookup-isbn (isbn &key (retry-attempts 3))
+  (let* ((json (http-get
+                (isbndb-uri isbn)
+                `(("Authorization" . ,*isbndb-api-key*))))
+         (result (gethash "book" (yason:parse json))))
     (cond
       ((null result)
-       (warn "Failed to get result...")
-       (sleep 1)
-       (lookup isbn))
+       (warn "Failed to get result: ~A" json)
+       (cond
+         ((plusp retry-attempts)
+          (sleep 1)
+          (lookup-isbn isbn :retry-attempts (1- retry-attempts)))
+         (t
+          (error "Exhausted retry limit"))))
       (t
        (make-instance 'isbn-result
                       :requested-isbn isbn
@@ -133,23 +106,6 @@
             whole
             (round (* 100 part)))))
 
-(defun print-info (record)
-  (format t "Found a book with ~D page~:P:~%" (isbn-result-page-count record))
-  (format t "  Title: ~A~%" (isbn-result-title record))
-  (format t "  Authors: ~{~%    * ~A~}~%" (isbn-result-authors record))
-  (format t "  Subjects: ~{~%    * ~A~}~%" (isbn-result-subjects record))
-  (format t "  Retail Value: $~A~%" (format-price (isbn-result-msrp record)))
-  (format t "  Offers:")
-  (cond
-    ((null (isbn-result-offers record))
-     (format t " None.~%"))
-    (t
-     (loop :for offer :in (isbn-result-offers record)
-           :do (format t "~%    * $~A in ~S condition"
-                       (format-price (offer-price offer))
-                       (offer-condition offer)))
-     (fresh-line))))
-
 (defun entry-summary (entry)
   (flet ((chop (n str)
            (if (<= (length str) n)
@@ -164,28 +120,6 @@
       (t
        "???"))))
 
-;;; database
-
-(defmacro with-db ((db path) &body body)
-  `(sqlite:with-open-database (,db ,path)
-     (sqlite:execute-non-query ,db "PRAGMA foreign_keys = ON;")
-     ,@body))
-
-(defun find-or-make-database (&key (root (user-homedir-pathname)))
-  (let ((db-path (merge-pathnames ".cadrlogue/media.db" root)))
-    (ensure-directories-exist db-path)
-    (cond
-      ((probe-file db-path)
-       db-path)
-      (t
-       (format t "~&Creating database...~%")
-       (with-db (db db-path)
-         (sqlite:with-transaction db
-           (sqlite:execute-non-query db "CREATE TABLE details (id INTEGER PRIMARY KEY, isbn13 STRING NULL, title STRING NULL, msrp_cents INTEGER NULL)")
-           (sqlite:execute-non-query db "CREATE TABLE offers (id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, condition STRING NULL, price_cents INTEGER NOT NULL, item INTEGER NOT NULL, FOREIGN KEY(item) REFERENCES details(id))")
-           (sqlite:execute-non-query db "CREATE TABLE media (physical_id INTEGER PRIMARY KEY AUTOINCREMENT, isbn STRING NULL, status STRING NOT NULL, info INTEGER NULL, FOREIGN KEY(info) REFERENCES details(id))")))
-       db-path))))
-
 ;;; Cataloguing flow
 
 (defun prompt-line (prompt)
@@ -195,52 +129,57 @@
 
 (defun find-details-id-by-isbn (db isbn)
   (assert (isbn? isbn))
-  (caar (sqlite:execute-to-list db "SELECT id FROM details WHERE isbn13=? LIMIT 1"
+  (caar (sqlite:execute-to-list db "SELECT pub_id FROM publication_details WHERE isbn=? LIMIT 1"
                                 isbn)))
 
-(defun record (db requested-isbn entry)
-  (etypecase entry
-    (isbn-result
-     (let ((info (find-details-id-by-isbn db (isbn-result-isbn entry))))
-       (cond
-         ((null info)
-          (sqlite:execute-non-query db
-                                    "INSERT INTO details (isbn13, title, msrp_cents) VALUES (?, ?, ?)"
-                                    (isbn-result-isbn13 entry)
-                                    (or (isbn-result-title entry)
-                                        (isbn-result-short-title entry))
-                                    (round (* 100 (isbn-result-msrp entry))))
-          (setf info (sqlite:last-insert-rowid db))
-          (dolist (offer (isbn-result-offers entry))
-            (sqlite:execute-non-query db
-                                      "INSERT INTO offers (timestamp, condition, price_cents,item) VALUES (?,?,?,?)"
-                                      (offer-creation-time offer)
-                                      (offer-condition offer)
-                                      (round (* 100 (offer-price offer)))
-                                      info))
-          (record db requested-isbn info))
-         (t
-          (record db requested-isbn info)))))
-    (integer
-     (sqlite:execute-non-query db
-                               "INSERT INTO media (isbn, status,info) VALUES (?, ?,?)"
-                               requested-isbn
-                               "ACTIVE"
-                               entry)
-     (sqlite:last-insert-rowid db))
-    ((member :UNKNOWN)
-     (sqlite:execute-non-query db
-                               "INSERT INTO media (isbn, status) VALUES (?, ?)"
-                               nil
-                               "ACTIVE")
-     (sqlite:last-insert-rowid db))))
+(defun record-anonymous (db)
+  "Record an anonymous artifact in the database. Details may be added later."
+  (sqlite:execute-non-query db
+                            "INSERT INTO media (timestamp, status) VALUES (?, ?)"
+                            (get-universal-time)
+                            "ACTIVE")
+  (sqlite:last-insert-rowid db))
 
-(defun print-barcode (id)
+(defun record-known (db pub-id &key requested-isbn)
+  "Record an artifact with a known publication ID."
+  (sqlite:execute-non-query db
+                            "INSERT INTO media (imprinted_isbn, timestamp, pub_id, status) VALUES (?, ?, ?,?)"
+                            requested-isbn
+                            (get-universal-time)
+                            pub-id
+                            "ACTIVE")
+  (sqlite:last-insert-rowid db))
+
+(defun record (db requested-isbn entry)
+  (check-type entry isbn-result)
+  (let ((info (find-details-id-by-isbn db (isbn-result-isbn entry))))
+    (when (null info)
+      (sqlite:execute-non-query db
+                                "INSERT INTO publication_details (isbn, title, msrp_cents) VALUES (?, ?, ?)"
+                                (isbn-result-isbn entry)
+                                (or (isbn-result-title entry)
+                                    (isbn-result-short-title entry))
+                                (round (* 100 (isbn-result-msrp entry))))
+      (setf info (sqlite:last-insert-rowid db))
+      (dolist (offer (isbn-result-offers entry))
+        (sqlite:execute-non-query db
+                                  "INSERT INTO offers (timestamp, condition, price_cents, pub_id) VALUES (?, ?, ?, ?)"
+                                  (offer-creation-time offer)
+                                  (offer-condition offer)
+                                  (round (* 100 (offer-price offer)))
+                                  info)))
+    (record-known db info :requested-isbn requested-isbn)))
+
+(defvar *barcode-printer* (make-instance 'epl2-printer :serial-device "/dev/ttyUSB3"))
+(defvar *barcode-format* ':code128)
+
+(defun print-id-as-barcode (id)
   (assert (<= 0 id 9999999999))
   (let ((id-string (format nil "~10,'0D" id)))
     (format t "~&==> printing code for ~A~%" id-string)
-    (print-barcode-label id-string)
+    (print-barcode *barcode-printer* *barcode-format* id-string)
     nil))
+
 
 (defun run (&key)
   (with-db (db (find-or-make-database))
@@ -248,15 +187,29 @@
       (let ((scan (prompt-line "Scan: ")))
         (cond
           ((isbn? scan)
+           ;; First check if we've seen this before...
            (let ((details-id (find-details-id-by-isbn db scan)))
              (cond
+               ;; We haven't...
                ((null details-id)
-                (print-barcode (record db scan (lookup scan))))
+                ;; ... so we'll try to look it up.
+                (multiple-value-bind (isbn-record error) (ignore-errors (lookup-isbn scan))
+                  (cond
+                    ;; Lookup failed, just record the thing and move on.
+                    ((or (not (null error))
+                         (null isbn-record))
+                     (warn "Failed to look up ISBN ~S" scan)
+                     (print-id-as-barcode (record-anonymous db)))
+                    ;; Lookup succeeded. Store it.
+                    (t
+                     (print-id-as-barcode (record db scan isbn-record))))))
+               ;; We have seen this kind of before.
                (t
-                (print-barcode (record db scan details-id))))))
-          ((string-equal scan "WEEE INSERT")
-           (print-barcode (record db nil ':unknown)))
-          ((string-equal scan "quit")
+                (print-id-as-barcode (record-known db details-id :requested-isbn scan))))))
+          ((string-equal scan "DEFER")
+           (print-id-as-barcode (record-anonymous db)))
+          ((string-equal scan "QUIT")
            (return-from run))
           (t
-           (warn "Unknown thing ~S, ignoring..." scan)))))))
+           (warn "Unknown command ~S, ignoring..." scan)))))))
+
