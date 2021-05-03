@@ -264,7 +264,9 @@
                 (unless (y-or-n-p "Is the above information correct?")
                   (go :REDO))
                 ;; TODO: record above info in database
-                (print-id-as-barcode (record-anonymous db)
+                (print-id-as-barcode (record-anonymous db
+                                                       :requested-isbn isbn
+                                                       :condition condition)
                                      :header (format-header title)))))
           ((string-equal scan "DEFER")
            (print-id-as-barcode (record-anonymous db)))
