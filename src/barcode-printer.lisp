@@ -135,7 +135,7 @@
     (let ((f (flexi-streams:make-flexi-stream f :external-format ':ascii)))
       (write-line "N" f)                ; Clear image buffer
       (when header
-        (format f "A0,0,0,1,1,1,N,~S~%" header))
-      (write-line (epl2-code128-command string :x 0 :y 25 :thin 3) f)
+        (format f "A10,5,0,1,1,1,N,~S~%" header))
+      (write-line (epl2-code128-command string :x 10 :y 30 :thin 2) f)
       (write-line "P1" f)               ; Print 1 copy
       nil)))
