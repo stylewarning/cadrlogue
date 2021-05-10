@@ -213,11 +213,11 @@
                 ;; ... so we'll try to look it up.
                 (multiple-value-bind (result error) (ignore-errors (lookup-isbn scan))
                   (cond
-                    ;; Lookup failed, just record the thing and move on.
+                    ;; Lookup failed, don't do anything...
                     ((or (not (null error))
                          (null result))
-                     (warn "Failed to look up ISBN ~S" scan)
-                     (print-id-as-barcode (record-anonymous db)))
+                     (warn "Failed to find information about ISBN ~S" scan)
+                     nil)
                     ;; Lookup succeeded. Store it.
                     (t
                      (print-id-as-barcode (record db scan result)
