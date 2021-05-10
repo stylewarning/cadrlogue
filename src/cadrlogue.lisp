@@ -128,6 +128,21 @@
   (finish-output)
   (read-line))
 
+(defun physical-id-exists-p (db phys-id)
+  (sqlite:execute-to-list db "SELECT physical_id FROM media WHERE physical_id=? LIMIT 1" phys-id))
+
+(defun retrieve-notes (db phys-id)
+  (let ((notes (sqlite:execute-to-list db "SELECT notes FROM media WHERE physical_id=? LIMIT 1" phys-id)))
+    (cond
+      ((null notes) (error "Physical ID ~S not found" phys-id))
+      ((null (caar notes)) nil)
+      (t (caar notes)))))
+
+(defun (setf retrieve-notes) (new-value db phys-id)
+  (check-type new-value string)
+  (sqlite:execute-non-query db "UPDATE media SET notes=? WHERE physical_id=?" new-value phys-id)
+  new-value)
+
 (defun find-details-id-by-isbn (db isbn)
   (assert (isbn? isbn))
   (caar (sqlite:execute-to-list db "SELECT pub_id FROM publication_details WHERE isbn=? LIMIT 1"
@@ -203,7 +218,8 @@
            (format t "    HELP       : Print this help message.~%")
            (format t "    DEFER      : Record a new physical item with no details.~%")
            (format t "    MANUAL     : Enter data manually for a new physical item.~%")
-           (format t "    CHECK-ISBN : Look up an ISBN and print data about it.~%"))
+           (format t "    CHECK-ISBN : Look up an ISBN and print data about it.~%")
+           (format t "    ADD-NOTE   : Add notes about a physical item.~%"))
           ((isbn? scan)
            ;; First check if we've seen this before...
            (let ((details-id (find-details-id-by-isbn db scan)))
@@ -229,6 +245,39 @@
                 (print-id-as-barcode (record-known db details-id :requested-isbn scan)
                                      :header (format-header
                                               (find-title-by-pubid db details-id)))))))
+          ((string-equal scan "ADD-NOTE")
+           (let ((physid (prompt-line "Physical ID: ")))
+             (cond
+               ((physical-id-exists-p db physid)
+                (let ((existing-notes (retrieve-notes db physid)))
+                  (unless (null existing-notes)
+                    (format t "Current notes: ~S~2%" existing-notes))
+                  (tagbody
+                   :REDO
+                     (let* ((new-notes (prompt-line "New notes: "))
+                            (to-do (prompt-line "[s]et, [a]ppend, [r]edo, or [c]ancel? ")))
+                       (cond
+                         ((or (/= 1 (length to-do))
+                              (not (find (char to-do 0) "sarc")))
+                          (warn "Invalid option.")
+                          nil)
+                         (t
+                          (ecase (char to-do 0)
+                            (#\s
+                             (setf (retrieve-notes db physid) new-notes))
+                            (#\a
+                             (setf (retrieve-notes db physid)
+                                   (concatenate
+                                    'string
+                                    (or existing-notes "")
+                                    (format nil "~2%")
+                                    new-notes)))
+                            (#\r
+                             (go :REDO))
+                            (#\c
+                             nil))))))))
+               (t
+                (warn "The physical ID ~S does not exist." physid)))))
           ((string-equal scan "CHECK-ISBN")
            (let ((isbn (prompt-line "ISBN: ")))
              (cond
@@ -261,6 +310,7 @@
                                      :do (loop-finish)
                                    :else
                                      :collect author)))
+                (declare (ignore authors))
                 (unless (y-or-n-p "Is the above information correct?")
                   (go :REDO))
                 ;; TODO: record above info in database
